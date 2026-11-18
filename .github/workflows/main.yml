@@ -1,0 +1,145 @@
+name: auto-recovery-vps
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */5 * * *'
+
+concurrency:
+  group: auto-vps
+  cancel-in-progress: false
+
+jobs:
+  vps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: Install rclone
+        uses: supplypike/setup-bin@v3
+        with:
+          uri: https://downloads.rclone.org/v1.65.0/rclone-v1.65.0-linux-amd64.zip
+          name: rclone
+          version: 'v1.65.0'
+
+      - name: Install Python deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libnss3 libxss1 rsync openssl curl unzip
+          pip install --quiet selenium webdriver-manager
+
+      - name: Configure rclone
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
+          chmod 600 ~/.config/rclone/rclone.conf
+
+      - name: Restore from previous life
+        env:
+          BACKUP_PASS: ${{ secrets.BACKUP_PASS }}
+        run: |
+          LATEST=$(rclone lsf your-remote:backups/actions/ --files-only --include 'session-*.enc' | sort | tail -1 || true)
+          if [ -n "$LATEST" ]; then
+            rclone copy "your-remote:backups/actions/$LATEST" /tmp/ --quiet
+            openssl enc -d -aes-256-cbc -pbkdf2 -in "/tmp/$LATEST" -out /tmp/restore.tar.gz -pass pass:"$BACKUP_PASS"
+            tar -xzf /tmp/restore.tar.gz -C /home/runner/work/ 2>/dev/null || true
+            echo "[+] Restored state from: $LATEST"
+          fi
+
+      - name: Start backup daemon
+        env:
+          BACKUP_PASS: ${{ secrets.BACKUP_PASS }}
+        run: |
+          cat > /tmp/backup-daemon.sh << 'EOF'
+          #!/bin/bash
+          set -u
+          BACKUP_PASS="${BACKUP_PASS:?}"
+          REMOTE="your-remote"
+          REMOTE_PATH="backups/actions"
+          INTERVAL=60
+          COLLECT_DIR="/tmp/collect"
+          WORK="/home/runner/work"
+          mkdir -p "$COLLECT_DIR"
+          cleanup() { rm -rf "$COLLECT_DIR"/* /tmp/session-backup.tar.gz /tmp/session-backup.enc; }
+          trap cleanup EXIT
+          while true; do
+            rsync -a --delete --include='*/' --include='*.py' --include='*.json' --include='*.txt' --include='*.csv' --include='*.log' --include='*.db' --include='*.pkl' --include='*.cookies' --exclude='*' "$WORK/" "$COLLECT_DIR/" 2>/dev/null
+            if [ -z "$(ls -A "$COLLECT_DIR")" ]; then sleep "$INTERVAL"; continue; fi
+            tar -czf /tmp/session-backup.tar.gz -C "$COLLECT_DIR" . 2>/dev/null || { sleep "$INTERVAL"; continue; }
+            openssl enc -aes-256-cbc -pbkdf2 -salt -in /tmp/session-backup.tar.gz -out /tmp/session-backup.enc -pass pass:"$BACKUP_PASS" 2>/dev/null || { sleep "$INTERVAL"; continue; }
+            STAMP=$(date +%Y%m%d-%H%M%S)-$RANDOM
+            rclone copy /tmp/session-backup.enc "$REMOTE:$REMOTE_PATH/session-$STAMP.enc" --no-traverse --quiet 2>/dev/null
+            rm -f /tmp/session-backup.tar.gz /tmp/session-backup.enc
+            sleep "$INTERVAL"
+          done
+          EOF
+          chmod +x /tmp/backup-daemon.sh
+          nohup /tmp/backup-daemon.sh > /tmp/backup.log 2>&1 &
+
+      - name: Run loop job
+        env:
+          BACKUP_PASS: ${{ secrets.BACKUP_PASS }}
+        run: |
+          cat > /tmp/selenium-job.py << 'EOF'
+          import time, logging, json
+          from pathlib import Path
+          from selenium import webdriver
+          from selenium.webdriver.chrome.options import Options
+          
+          logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
+          log = logging.getLogger('job')
+          STATE_DIR = Path('/home/runner/work/state')
+          STATE_DIR.mkdir(parents=True, exist_ok=True)
+          
+          def build_driver():
+              o = Options()
+              o.add_argument('--headless=new')
+              o.add_argument('--no-sandbox')
+              o.add_argument('--disable-dev-shm-usage')
+              return webdriver.Chrome(options=o)
+          
+          def main():
+              log.info('boot')
+              d = build_driver()
+              while True:
+                  try:
+                      d.get('https://example.com')
+                      log.info('tick - working')
+                      (STATE_DIR / 'last_state.json').write_text(json.dumps({'url': d.current_url, 'ts': time.time()}))
+                  except Exception as e:
+                      log.error('error: %s' % e)
+                      try: d.quit()
+                      except: pass
+                      time.sleep(10)
+                      d = build_driver()
+                  time.sleep(30)
+          
+          if __name__ == '__main__': main()
+          EOF
+          python /tmp/selenium-job.py
+
+      - name: Final escape
+        if: always()
+        env:
+          BACKUP_PASS: ${{ secrets.BACKUP_PASS }}
+        run: |
+          if [ -z "$BACKUP_PASS" ]; then exit 0; fi
+          cat > /tmp/final-escape.sh << 'EOF'
+          #!/bin/bash
+          set -u
+          tar -czf /tmp/final.tar.gz -C /home/runner/work . 2>/dev/null || exit 0
+          openssl enc -aes-256-cbc -pbkdf2 -salt -in /tmp/final.tar.gz -out /tmp/final.enc -pass pass:"$BACKUP_PASS" 2>/dev/null || exit 0
+          STAMP=$(date +%Y%m%d-%H%M%S)-$RANDOM
+          rclone copy /tmp/final.enc "your-remote:backups/actions/final/final-$STAMP.enc" --no-traverse --quiet 2>/dev/null
+          rm -f /tmp/final.tar.gz /tmp/final.enc
+          EOF
+          chmod +x /tmp/final-escape.sh
+          /tmp/final-escape.sh
