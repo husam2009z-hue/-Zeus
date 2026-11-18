@@ -23,7 +23,7 @@ jobs:
       - name: Install deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq libnss3 libgconf-2-4 libxss1 libappindicator1 libindicator7 rsync openssl curl unzip
+          sudo apt-get install -y -qq libnss3 libgconf-2-4 libxss1 rsync openssl curl unzip
           pip install --quiet selenium webdriver-manager
           curl -s https://rclone.org/install.sh | sudo bash -s -- --version 1.65.0
       - name: Configure rclone
