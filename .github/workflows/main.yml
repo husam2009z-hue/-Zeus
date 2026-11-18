@@ -1,4 +1,4 @@
-name: ALRAES
+name: Telegram Bot Manager
 
 on:
   workflow_dispatch:
@@ -21,11 +21,35 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install dependencies
+      - name: Install dependencies and rclone
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq sqlite3
+          sudo apt-get install -y -qq sqlite3 curl unzip
+          # تثبيت rclone
+          curl https://rclone.org/install.sh | sudo bash
+          # تثبيت مكتبات البايثون
           pip install --quiet pyTelegramBotAPI requests
+
+      - name: Configure rclone
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
+          chmod 600 ~/.config/rclone/rclone.conf
+
+      - name: Restore from previous session
+        env:
+          BACKUP_PASS: ${{ secrets.BACKUP_PASS }}
+        run: |
+          # جلب آخر نسخة احتياطية إذا موجودة
+          LATEST=$(rclone lsf myremote:bot_backups/ --files-only | sort | tail -1 || true)
+          if [ -n "$LATEST" ]; then
+            rclone copy "myremote:bot_backups/$LATEST" /tmp/ --quiet
+            openssl enc -d -aes-256-cbc -pbkdf2 -in "/tmp/$LATEST" -out /tmp/restore.tar.gz -pass pass:"$BACKUP_PASS"
+            tar -xzf /tmp/restore.tar.gz -C ./ 2>/dev/null || true
+            echo "[+] Restored from: $LATEST"
+          fi
 
       - name: Create bot.py automatically
         run: |
@@ -39,7 +63,6 @@ jobs:
           import threading
           import sqlite3
           
-          # تم وضع التوكن مباشرة هنا بناءً على طلبك
           TOKEN = '9198599064:AAGb5pT8pnMrz6LSsv-5h7VSjuiRvq0m154'
               
           bot = telebot.TeleBot(TOKEN, parse_mode='HTML')
@@ -248,3 +271,16 @@ jobs:
       - name: Run Telegram Bot
         run: |
           python bot.py
+
+      - name: Backup to rclone
+        if: always()
+        env:
+          BACKUP_PASS: ${{ secrets.BACKUP_PASS }}
+        run: |
+          # تجميع الملفات وتشفيرها ورفعها
+          tar -czf /tmp/backup.tar.gz users.db uploaded_files/ 2>/dev/null || true
+          if [ -f /tmp/backup.tar.gz ]; then
+            openssl enc -aes-256-cbc -pbkdf2 -salt -in /tmp/backup.tar.gz -out /tmp/backup.enc -pass pass:"$BACKUP_PASS"
+            STAMP=$(date +%Y%m%d-%H%M%S)
+            rclone copy /tmp/backup.enc "myremote:bot_backups/backup-$STAMP.enc" --quiet
+          fi
