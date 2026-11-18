@@ -1,4 +1,0 @@
-telethon
-yt-dlp
-deep-translator
-pytz
