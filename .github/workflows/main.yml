@@ -3,7 +3,7 @@ name: Telegram Bot Manager
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */5 * * *'  # يشتغل تلقائياً كل 5 ساعات عشان ما يتوقف
+    - cron: '0 */5 * * *'
 
 concurrency:
   group: bot-manager
@@ -25,10 +25,17 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq sqlite3
+          
+          # هذا الجزء ينشئ ملف requirements.txt تلقائياً إذا ما موجود
+          if [ ! -f requirements.txt ]; then
+            echo "pyTelegramBotAPI" > requirements.txt
+            echo "requests" >> requirements.txt
+          fi
+          
           pip install --quiet -r requirements.txt
 
       - name: Run Telegram Bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
         run: |
-          python "bot.py"
+          python bot.py
