@@ -2,11 +2,11 @@ name: auto-recovery-vps
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */5 * * *' # يشتغل تلقائياً كل 5 ساعات
+    - cron: '0 */5 * * *'
 
 concurrency:
   group: auto-vps
-  cancel-in-progress: false # ما يقطع الجلسة الحالية اذا تأخرت
+  cancel-in-progress: false
 
 jobs:
   vps:
@@ -20,12 +20,14 @@ jobs:
       - uses: browser-actions/setup-chrome@v1
         with:
           chrome-version: stable
+          
       - name: Install deps
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq libnss3 libxss1 rsync openssl curl unzip
           pip install --quiet selenium webdriver-manager
           curl -s https://rclone.org/install.sh | sudo bash -s -- --version 1.65.0
+
       - name: Configure rclone
         env:
           RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
@@ -33,6 +35,7 @@ jobs:
           mkdir -p ~/.config/rclone
           echo "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
           chmod 600 ~/.config/rclone/rclone.conf
+
       - name: Restore from previous life
         env:
           BACKUP_PASS: ${{ secrets.BACKUP_PASS }}
@@ -44,21 +47,96 @@ jobs:
             tar -xzf /tmp/restore.tar.gz -C /home/runner/work/ 2>/dev/null || true
             echo "[+] Restored state from: $LATEST"
           fi
+
       - name: Start backup daemon
         env:
           BACKUP_PASS: ${{ secrets.BACKUP_PASS }}
         run: |
-          chmod +x scripts/backup-daemon.sh
-          nohup scripts/backup-daemon.sh > /tmp/backup.log 2>&1 &
+          # إنشاء سكربت النسخ الاحتياطي وتشغيله في الخلفية
+          cat > /tmp/backup-daemon.sh << 'EOF'
+          #!/bin/bash
+          set -u
+          BACKUP_PASS="${BACKUP_PASS:?}"
+          REMOTE="your-remote"
+          REMOTE_PATH="backups/actions"
+          INTERVAL=60
+          COLLECT_DIR="/tmp/collect"
+          WORK="/home/runner/work"
+          mkdir -p "$COLLECT_DIR"
+          cleanup() { rm -rf "$COLLECT_DIR"/* /tmp/session-backup.tar.gz /tmp/session-backup.enc; }
+          trap cleanup EXIT
+          while true; do
+            rsync -a --delete --include='*/' --include='*.py' --include='*.json' --include='*.txt' --include='*.csv' --include='*.log' --include='*.db' --include='*.pkl' --include='*.cookies' --exclude='*' "$WORK/" "$COLLECT_DIR/" 2>/dev/null
+            if [ -z "$(ls -A "$COLLECT_DIR")" ]; then sleep "$INTERVAL"; continue; fi
+            tar -czf /tmp/session-backup.tar.gz -C "$COLLECT_DIR" . 2>/dev/null || { sleep "$INTERVAL"; continue; }
+            openssl enc -aes-256-cbc -pbkdf2 -salt -in /tmp/session-backup.tar.gz -out /tmp/session-backup.enc -pass pass:"$BACKUP_PASS" 2>/dev/null || { sleep "$INTERVAL"; continue; }
+            STAMP=$(date +%Y%m%d-%H%M%S)-$RANDOM
+            rclone copy /tmp/session-backup.enc "$REMOTE:$REMOTE_PATH/session-$STAMP.enc" --no-traverse --quiet 2>/dev/null
+            rm -f /tmp/session-backup.tar.gz /tmp/session-backup.enc
+            sleep "$INTERVAL"
+          done
+          EOF
+          chmod +x /tmp/backup-daemon.sh
+          nohup /tmp/backup-daemon.sh > /tmp/backup.log 2>&1 &
+
       - name: Run loop job
         env:
           BACKUP_PASS: ${{ secrets.BACKUP_PASS }}
         run: |
-          chmod +x scripts/final-escape.sh
-          trap 'scripts/final-escape.sh' EXIT SIGTERM SIGINT
-          python scripts/selenium-job.py
+          # إنشاء سكربت السيلينيوم وتشغيله
+          cat > /tmp/selenium-job.py << 'EOF'
+          import time, logging, json
+          from pathlib import Path
+          from selenium import webdriver
+          from selenium.webdriver.chrome.options import Options
+          
+          logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
+          log = logging.getLogger('job')
+          STATE_DIR = Path('/home/runner/work/state')
+          STATE_DIR.mkdir(parents=True, exist_ok=True)
+          
+          def build_driver():
+              o = Options()
+              o.add_argument('--headless=new')
+              o.add_argument('--no-sandbox')
+              o.add_argument('--disable-dev-shm-usage')
+              return webdriver.Chrome(options=o)
+          
+          def main():
+              log.info('boot')
+              d = build_driver()
+              while True:
+                  try:
+                      d.get('https://example.com')
+                      log.info('tick - working')
+                      (STATE_DIR / 'last_state.json').write_text(json.dumps({'url': d.current_url, 'ts': time.time()}))
+                  except Exception as e:
+                      log.error('error: %s' % e)
+                      try: d.quit()
+                      except: pass
+                      time.sleep(10)
+                      d = build_driver()
+                  time.sleep(30)
+          
+          if __name__ == '__main__': main()
+          EOF
+          python /tmp/selenium-job.py
+
       - name: Final escape
         if: always()
         env:
           BACKUP_PASS: ${{ secrets.BACKUP_PASS }}
-        run: scripts/final-escape.sh
+        run: |
+          # إنشاء وتشغيل سكربت الهروب الأخير
+          if [ -z "$BACKUP_PASS" ]; then exit 0; fi
+          cat > /tmp/final-escape.sh << 'EOF'
+          #!/bin/bash
+          set -u
+          tar -czf /tmp/final.tar.gz -C /home/runner/work . 2>/dev/null || exit 0
+          openssl enc -aes-256-cbc -pbkdf2 -salt -in /tmp/final.tar.gz -out /tmp/final.enc -pass pass:"$BACKUP_PASS" 2>/dev/null || exit 0
+          STAMP=$(date +%Y%m%d-%H%M%S)-$RANDOM
+          rclone copy /tmp/final.enc "your-remote:backups/actions/final/final-$STAMP.enc" --no-traverse --quiet 2>/dev/null
+          rm -f /tmp/final.tar.gz /tmp/final.enc
+          EOF
+          chmod +x /tmp/final-escape.sh
+          /tmp/final-escape.sh
