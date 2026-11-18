@@ -20,13 +20,19 @@ jobs:
       - uses: browser-actions/setup-chrome@v1
         with:
           chrome-version: stable
-          
-      - name: Install deps
+
+      - name: Install rclone
+        uses: supplypike/setup-bin@v3
+        with:
+          uri: https://downloads.rclone.org/v1.65.0/rclone-v1.65.0-linux-amd64.zip
+          name: rclone
+          version: 'v1.65.0'
+
+      - name: Install Python deps
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq libnss3 libxss1 rsync openssl curl unzip
           pip install --quiet selenium webdriver-manager
-          curl -s https://rclone.org/install.sh | sudo bash -s -- --version 1.65.0
 
       - name: Configure rclone
         env:
@@ -52,7 +58,6 @@ jobs:
         env:
           BACKUP_PASS: ${{ secrets.BACKUP_PASS }}
         run: |
-          # إنشاء سكربت النسخ الاحتياطي وتشغيله في الخلفية
           cat > /tmp/backup-daemon.sh << 'EOF'
           #!/bin/bash
           set -u
@@ -83,7 +88,6 @@ jobs:
         env:
           BACKUP_PASS: ${{ secrets.BACKUP_PASS }}
         run: |
-          # إنشاء سكربت السيلينيوم وتشغيله
           cat > /tmp/selenium-job.py << 'EOF'
           import time, logging, json
           from pathlib import Path
@@ -127,7 +131,6 @@ jobs:
         env:
           BACKUP_PASS: ${{ secrets.BACKUP_PASS }}
         run: |
-          # إنشاء وتشغيل سكربت الهروب الأخير
           if [ -z "$BACKUP_PASS" ]; then exit 0; fi
           cat > /tmp/final-escape.sh << 'EOF'
           #!/bin/bash
